@@ -62,6 +62,15 @@ BASE = f"xiongmai/{CAM_NAME}"
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))
 
 PRESETS = json.loads(os.environ.get("PRESETS", '{"1": "Preset 1"}'))
+# Optional per-entity name overrides, e.g. {"ptz_home": "PTZ домой", "volume": "Громкость"}.
+# Keys: ptz_home, osd_title, osd_time, volume, white_light, ptz_directionleft,
+# ptz_directionright, ptz_directionup, ptz_directiondown.
+LABELS = json.loads(os.environ.get("LABELS", "{}"))
+
+
+def label(key, default):
+    return LABELS.get(key, default)
+
 PTZ_IMPULSE = float(os.environ.get("PTZ_IMPULSE", "0.8"))
 # Empty string disables backlash compensation (single GotoPreset, less accurate).
 PTZ_APPROACH = os.environ.get("PTZ_APPROACH", "DirectionRightDown")
@@ -157,36 +166,40 @@ class Bridge:
 
         for command, name, icon in DIRECTION_BUTTONS:
             disco("button", f"ptz_{command.lower()}", {
-                "name": name, "unique_id": f"xiongmai_{CAM_NAME}_ptz_{command.lower()}",
+                "name": label(f"ptz_{command.lower()}", name),
+                "unique_id": f"xiongmai_{CAM_NAME}_ptz_{command.lower()}",
                 "command_topic": f"{BASE}/ptz/{command}/set", "payload_press": "PRESS",
                 "icon": icon})
 
-        for slot, label in PRESETS.items():
+        for slot, label_preset in PRESETS.items():
             disco("button", f"preset_{slot}", {
-                "name": f"Preset {label}", "icon": "mdi:bookmark",
+                "name": f"{label('preset_prefix', 'Preset')} {label_preset}",
+                "icon": "mdi:bookmark",
                 "unique_id": f"xiongmai_{CAM_NAME}_preset_{slot}",
                 "command_topic": f"{BASE}/preset/{slot}/set", "payload_press": "PRESS"})
 
         disco("button", "ptz_home", {
-            "name": "PTZ home", "unique_id": f"xiongmai_{CAM_NAME}_ptz_home",
+            "name": label("ptz_home", "PTZ home"),
+            "unique_id": f"xiongmai_{CAM_NAME}_ptz_home",
             "command_topic": f"{BASE}/ptz/Reset/set", "payload_press": "PRESS",
             "icon": "mdi:home-import-outline"})
 
         for key, name, icon in (("osd_title", "OSD channel title", "mdi:format-text"),
                                 ("osd_time", "OSD time", "mdi:clock-outline")):
             disco("switch", key, {
-                "name": name, "unique_id": f"xiongmai_{CAM_NAME}_{key}",
+                "name": label(key, name), "unique_id": f"xiongmai_{CAM_NAME}_{key}",
                 "command_topic": f"{BASE}/{key}/set", "state_topic": f"{BASE}/{key}/state",
                 "payload_on": "ON", "payload_off": "OFF", "icon": icon})
 
         disco("number", "volume", {
-            "name": "Speaker volume", "unique_id": f"xiongmai_{CAM_NAME}_volume",
+            "name": label("volume", "Speaker volume"),
+            "unique_id": f"xiongmai_{CAM_NAME}_volume",
             "command_topic": f"{BASE}/volume/set", "state_topic": f"{BASE}/volume/state",
             "min": 0, "max": 100, "step": 1, "mode": "slider",
             "icon": "mdi:volume-high", "unit_of_measurement": "%"})
 
         disco("number", "white_light", {
-            "name": "White light brightness",
+            "name": label("white_light", "White light brightness"),
             "unique_id": f"xiongmai_{CAM_NAME}_white_light",
             "command_topic": f"{BASE}/white_light/set",
             "state_topic": f"{BASE}/white_light/state",

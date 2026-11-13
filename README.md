@@ -29,11 +29,33 @@ Assistant never shows a value the camera did not accept.
 
 ## Install
 
+Prebuilt multi-arch images (`linux/amd64`, `linux/arm64`) are published to
+GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/hametovbr/xiongmai-camera-bridge:0.1.0
+```
+
+With Compose, drop this next to your `.env`:
+
+```yaml
+services:
+  xiongmai-camera:
+    image: ghcr.io/hametovbr/xiongmai-camera-bridge:0.1.0
+    container_name: xiongmai-camera
+    restart: unless-stopped
+    env_file: [.env]
+```
+
+`edge` tracks `main`, `latest` points at the newest release tag.
+
+From source:
+
 ```bash
 git clone https://github.com/hametovbr/xiongmai-camera-bridge
 cd xiongmai-camera-bridge
 cp env.example .env        # fill in CAM_HOST, CAM_PASS, MQTT_*
-docker compose up -d
+docker compose up -d --build
 docker compose logs -f
 ```
 
@@ -63,6 +85,7 @@ Everything is environment variables; `env.example` is the annotated list.
 | `CAM_NAME` | `xiongmai` | MQTT topic segment and entity id prefix |
 | `DEVICE_NAME` | `Xiongmai camera` | name shown in Home Assistant |
 | `PRESETS` | `{"1": "Preset 1"}` | JSON map `slot -> label` to expose as buttons |
+| `LABELS` | `{}` | optional rename of entities, e.g. `{"volume": "Громкость"}` |
 | `PTZ_IMPULSE` | `0.8` | seconds of movement per direction button press |
 | `PTZ_APPROACH` | `DirectionRightDown` | direction of the final approach (empty = off) |
 | `PRESET_SETTLE` / `PRESET_NUDGE` | `9` / `0.4` | wait after goto, length of the approach impulse |
