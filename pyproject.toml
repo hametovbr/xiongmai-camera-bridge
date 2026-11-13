@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xiongmai-camera-bridge"
-version = "0.1.0"
+version = "0.2.0"
 description = "DVRIP to MQTT bridge for Xiongmai (XMeye/XMSECU) PTZ cameras, with Home Assistant discovery"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
 dependencies = [
     "paho-mqtt>=2.0",
+    "PyYAML>=6",
 ]
 
 [project.optional-dependencies]

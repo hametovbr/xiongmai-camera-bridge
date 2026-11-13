@@ -1,10 +1,15 @@
-"""DVRIP -> MQTT bridge with Home Assistant discovery.
+"""DVRIP -> MQTT bridge with Home Assistant discovery, for one or many cameras.
 
 Xiongmai cameras have no ONVIF and no HTTP API, so Home Assistant cannot reach
 their PTZ, on-screen display, speaker volume or white light. This bridge talks
-DVRIP (TCP 34567) and exposes what the camera really supports as MQTT entities.
+DVRIP (TCP 34567) and exposes what each camera really supports as MQTT entities.
 
-Exposed entities (all under one HA device):
+Everything below one device is per camera; several cameras run inside one
+process, each with its own poll thread, its own command lock and its own
+availability topic. A slow preset move on one camera therefore does not block
+commands to the others, and a camera that is offline only takes itself offline.
+
+Exposed entities (per camera):
 
     button  PTZ left / right / up / down     bounded move, then explicit stop
     button  PTZ home                         Reset (firmware re-centres the head)
@@ -14,18 +19,15 @@ Exposed entities (all under one HA device):
     number  speaker volume                   fVideo.Volume[*].LeftVolume/RightVolume
     number  white light brightness           Camera.WhiteLight.Brightness
 
+Entities are published only when the camera reports the section: a model without
+a speaker or white light simply does not get those entities.
+
 Every write is read back before the state is published: if the camera did not
-confirm the value, Home Assistant sees the old value instead of a false success.
+confirm the value, Home Assistant keeps the old one instead of a false success.
 
-Environment (see env.example):
-
-    CAM_HOST, CAM_PORT, CAM_USER, CAM_PASS   camera connection (password required)
-    CAM_NAME, DEVICE_NAME                    topic/entity id and HA device name
-    PRESETS                                  JSON map slot -> label
-    PTZ_IMPULSE                              seconds per direction button press
-    PTZ_APPROACH                             direction used to load the gears
-    MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS
-    POLL_SECONDS                             state refresh interval
+Configuration is described in docs/configuration.md; the short version is
+CAMERAS_FILE (YAML/JSON list), CAMERAS (JSON list) or the single-camera
+CAM_HOST/CAM_PASS variables.
 """
 
 import json
@@ -36,46 +38,24 @@ import time
 
 import paho.mqtt.client as mqtt
 
-from .dvrip import Dvrip
-from .ptz import goto_preset, move
+from .config import load as load_cameras
+from .dvrip import Dvrip, DvripError
+from .ptz import DIRECTIONS, goto_preset, move
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("xiongmai-bridge")
 
-CAM_HOST = os.environ.get("CAM_HOST", "192.168.1.10")
-CAM_PORT = int(os.environ.get("CAM_PORT", "34567"))
-CAM_USER = os.environ.get("CAM_USER", "admin")
-CAM_PASS = os.environ["CAM_PASS"]
-
-CAM_NAME = os.environ.get("CAM_NAME", "xiongmai")
-DEVICE_NAME = os.environ.get("DEVICE_NAME", "Xiongmai camera")
-DEVICE_MODEL = os.environ.get("DEVICE_MODEL", "Xiongmai IP camera")
-
 MQTT_HOST = os.environ.get("MQTT_HOST", "127.0.0.1")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USER = os.environ.get("MQTT_USER") or None
 MQTT_PASS = os.environ.get("MQTT_PASS") or None
-
 DISCOVERY_PREFIX = os.environ.get("DISCOVERY_PREFIX", "homeassistant")
-BASE = f"xiongmai/{CAM_NAME}"
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))
 
-PRESETS = json.loads(os.environ.get("PRESETS", '{"1": "Preset 1"}'))
-# Optional per-entity name overrides, e.g. {"ptz_home": "PTZ домой", "volume": "Громкость"}.
-# Keys: ptz_home, osd_title, osd_time, volume, white_light, ptz_directionleft,
-# ptz_directionright, ptz_directionup, ptz_directiondown.
-LABELS = json.loads(os.environ.get("LABELS", "{}"))
-
-
-def label(key, default):
-    return LABELS.get(key, default)
-
-PTZ_IMPULSE = float(os.environ.get("PTZ_IMPULSE", "0.8"))
-# Empty string disables backlash compensation (single GotoPreset, less accurate).
-PTZ_APPROACH = os.environ.get("PTZ_APPROACH", "DirectionRightDown")
-PRESET_SETTLE = float(os.environ.get("PRESET_SETTLE", "9"))
-PRESET_NUDGE = float(os.environ.get("PRESET_NUDGE", "0.4"))
+# One availability topic for the whole process: lets Home Assistant show every
+# camera as unavailable when the bridge itself dies (last will, retained).
+BRIDGE_AVAILABILITY = os.environ.get("BRIDGE_AVAILABILITY",
+                                     "xiongmai/bridge/availability")
 
 DIRECTION_BUTTONS = (
     ("DirectionLeft", "PTZ left", "mdi:arrow-left-bold"),
@@ -85,212 +65,328 @@ DIRECTION_BUTTONS = (
 )
 
 
-def with_cam(fn):
-    """Run one operation on a fresh session: the camera drops idle sessions."""
-    cam = Dvrip(CAM_HOST, CAM_USER, CAM_PASS, port=CAM_PORT)
-    try:
-        return fn(cam)
-    finally:
-        cam.close()
+class CameraWorker:
+    """One camera: its own poll thread, command lock, state and discovery."""
 
+    def __init__(self, cfg, publisher):
+        self.cfg = cfg
+        self.publish = publisher              # callable(topic, payload, retain)
+        self.lock = threading.Lock()          # serialises commands to this camera
+        self.state = {}
+        self.features = None                  # filled by probe()
+        self.discovered = False
 
-# ---------------------------------------------------------------- state
+    # -- connection helpers
 
-def read_state(cam):
-    fvideo = cam.get_config("fVideo")
-    camera = cam.get_config("Camera")
-    gui = fvideo.get("GUISet") or {}
-    volume = (fvideo.get("Volume") or [{}])[0].get("LeftVolume", 0)
-    light = camera.get("WhiteLight") or {}
-    return {
-        "osd_title": bool(gui.get("ChannelTitleEnable")),
-        "osd_time": bool(gui.get("TimeTitleEnable")),
-        "volume": int(volume),
-        "white_light": int(light.get("Brightness", 0)),
-        "white_light_mode": light.get("WorkMode", "?"),
-    }
+    def session(self):
+        return Dvrip(self.cfg.host, self.cfg.user, self.cfg.password, port=self.cfg.port)
 
+    def call(self, fn):
+        """Run fn(cam) on a fresh session; the camera drops idle sessions."""
+        cam = self.session()
+        try:
+            return fn(cam)
+        finally:
+            cam.close()
 
-def set_osd(cam, field, value):
-    fvideo = cam.get_config("fVideo")
-    fvideo.setdefault("GUISet", {})[field] = bool(value)
-    cam.set_config("fVideo", fvideo)
-    return read_state(cam)          # read back: publish only confirmed values
+    # -- feature detection
 
+    def probe(self):
+        """Ask the camera which sections exist; missing sections drop entities."""
+        def work(cam):
+            feats = {"fvideo": False, "osd_title": False, "osd_time": False,
+                     "volume": False, "white_light": False, "slots": []}
+            try:
+                fvideo = cam.get_config("fVideo") or {}
+                feats["fvideo"] = True
+                gui = fvideo.get("GUISet") or {}
+                feats["osd_title"] = "ChannelTitleEnable" in gui
+                feats["osd_time"] = "TimeTitleEnable" in gui
+                feats["volume"] = bool(fvideo.get("Volume") or fvideo.get("VolumeIn"))
+            except DvripError as exc:
+                log.info("%s: no fVideo section (%s)", self.cfg.name, exc)
+            try:
+                camera = cam.get_config("Camera") or {}
+                feats["white_light"] = bool(camera.get("WhiteLight"))
+            except DvripError as exc:
+                log.info("%s: no Camera section (%s)", self.cfg.name, exc)
+            try:
+                uart = cam.get_config("Uart") or {}
+                groups = uart.get("PTZPreset") or [[]]
+                feats["slots"] = [p.get("Id") for p in groups[0]]
+            except DvripError:
+                pass
+            return feats
 
-def set_volume(cam, value):
-    fvideo = cam.get_config("fVideo")
-    for key in ("Volume", "VolumeIn"):
-        for item in fvideo.get(key) or []:
-            item["LeftVolume"] = item["RightVolume"] = int(value)
-    cam.set_config("fVideo", fvideo)
-    return read_state(cam)
+        feats = self.call(work)
+        # explicit switches in the config win over detection
+        for key in ("osd", "volume", "white_light"):
+            if self.cfg.__dict__.get(key) is not None:
+                enabled = bool(self.cfg.__dict__[key])
+                if key == "osd":
+                    feats["osd_title"] = feats["osd_time"] = enabled
+                else:
+                    feats[key] = enabled
+        self.features = feats
+        log.info("%s: features %s", self.cfg.name,
+                 {k: v for k, v in feats.items() if k != "slots"})
+        return feats
 
+    @property
+    def has_ptz(self):
+        return self.cfg.ptz is not False
 
-def set_white_light(cam, value):
-    camera = cam.get_config("Camera")
-    camera.setdefault("WhiteLight", {})["Brightness"] = int(value)
-    cam.set_config("Camera", camera)
-    return read_state(cam)
+    # -- state
 
+    def read_state(self):
+        feats = self.features or {}
 
-# ---------------------------------------------------------------- bridge
+        def work(cam):
+            state = {}
+            if feats.get("fvideo"):
+                fvideo = cam.get_config("fVideo") or {}
+                gui = fvideo.get("GUISet") or {}
+                if feats.get("osd_title"):
+                    state["osd_title"] = bool(gui.get("ChannelTitleEnable"))
+                if feats.get("osd_time"):
+                    state["osd_time"] = bool(gui.get("TimeTitleEnable"))
+                if feats.get("volume"):
+                    items = fvideo.get("Volume") or fvideo.get("VolumeIn") or [{}]
+                    state["volume"] = int(items[0].get("LeftVolume", 0))
+            if feats.get("white_light"):
+                camera = cam.get_config("Camera") or {}
+                light = camera.get("WhiteLight") or {}
+                state["white_light"] = int(light.get("Brightness", 0))
+                state["white_light_mode"] = light.get("WorkMode", "?")
+            return state
 
-class Bridge:
-    def __init__(self):
-        self.state = {"osd_title": True, "osd_time": True,
-                      "volume": 0, "white_light": 0, "white_light_mode": "?"}
-        self.lock = threading.Lock()
-        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
-                                  client_id=f"xiongmai-{CAM_NAME}")
-        if MQTT_USER:
-            self.client.username_pw_set(MQTT_USER, MQTT_PASS)
-        self.client.will_set(f"{BASE}/availability", "offline", retain=True)
-        self.client.on_connect = self.on_connect
-        self.client.on_message = self.on_message
-
-    def device(self):
-        return {"identifiers": [f"xiongmai_{CAM_NAME}"], "name": DEVICE_NAME,
-                "manufacturer": "Xiongmai", "model": DEVICE_MODEL,
-                "configuration_url": f"http://{CAM_HOST}"}
-
-    def publish_discovery(self):
-        device = self.device()
-        avail = {"availability_topic": f"{BASE}/availability",
-                 "payload_available": "online", "payload_not_available": "offline"}
-
-        def disco(component, object_id, payload):
-            topic = f"{DISCOVERY_PREFIX}/{component}/{CAM_NAME}/{object_id}/config"
-            self.client.publish(topic, json.dumps({**payload, "device": device, **avail}),
-                                retain=True)
-
-        for command, name, icon in DIRECTION_BUTTONS:
-            disco("button", f"ptz_{command.lower()}", {
-                "name": label(f"ptz_{command.lower()}", name),
-                "unique_id": f"xiongmai_{CAM_NAME}_ptz_{command.lower()}",
-                "command_topic": f"{BASE}/ptz/{command}/set", "payload_press": "PRESS",
-                "icon": icon})
-
-        for slot, label_preset in PRESETS.items():
-            disco("button", f"preset_{slot}", {
-                "name": f"{label('preset_prefix', 'Preset')} {label_preset}",
-                "icon": "mdi:bookmark",
-                "unique_id": f"xiongmai_{CAM_NAME}_preset_{slot}",
-                "command_topic": f"{BASE}/preset/{slot}/set", "payload_press": "PRESS"})
-
-        disco("button", "ptz_home", {
-            "name": label("ptz_home", "PTZ home"),
-            "unique_id": f"xiongmai_{CAM_NAME}_ptz_home",
-            "command_topic": f"{BASE}/ptz/Reset/set", "payload_press": "PRESS",
-            "icon": "mdi:home-import-outline"})
-
-        for key, name, icon in (("osd_title", "OSD channel title", "mdi:format-text"),
-                                ("osd_time", "OSD time", "mdi:clock-outline")):
-            disco("switch", key, {
-                "name": label(key, name), "unique_id": f"xiongmai_{CAM_NAME}_{key}",
-                "command_topic": f"{BASE}/{key}/set", "state_topic": f"{BASE}/{key}/state",
-                "payload_on": "ON", "payload_off": "OFF", "icon": icon})
-
-        disco("number", "volume", {
-            "name": label("volume", "Speaker volume"),
-            "unique_id": f"xiongmai_{CAM_NAME}_volume",
-            "command_topic": f"{BASE}/volume/set", "state_topic": f"{BASE}/volume/state",
-            "min": 0, "max": 100, "step": 1, "mode": "slider",
-            "icon": "mdi:volume-high", "unit_of_measurement": "%"})
-
-        disco("number", "white_light", {
-            "name": label("white_light", "White light brightness"),
-            "unique_id": f"xiongmai_{CAM_NAME}_white_light",
-            "command_topic": f"{BASE}/white_light/set",
-            "state_topic": f"{BASE}/white_light/state",
-            "min": 0, "max": 100, "step": 1, "mode": "slider",
-            "icon": "mdi:light-flood-down", "unit_of_measurement": "%"})
-
-        self.client.publish(f"{BASE}/state", json.dumps(self.state), retain=True)
+        return self.call(work)
 
     def publish_state(self, state):
-        self.client.publish(f"{BASE}/osd_title/state",
-                            "ON" if state["osd_title"] else "OFF", retain=True)
-        self.client.publish(f"{BASE}/osd_time/state",
-                            "ON" if state["osd_time"] else "OFF", retain=True)
-        self.client.publish(f"{BASE}/volume/state", str(state["volume"]), retain=True)
-        self.client.publish(f"{BASE}/white_light/state", str(state["white_light"]),
-                            retain=True)
-        self.client.publish(f"{BASE}/state", json.dumps(state), retain=True)
-        self.client.publish(f"{BASE}/availability", "online", retain=True)
+        for key in ("osd_title", "osd_time"):
+            if key in state:
+                self.publish(f"{self.cfg.base}/{key}/state",
+                             "ON" if state[key] else "OFF", True)
+        for key in ("volume", "white_light"):
+            if key in state:
+                self.publish(f"{self.cfg.base}/{key}/state", str(state[key]), True)
+        self.publish(f"{self.cfg.base}/state", json.dumps(state), True)
+        self.publish(f"{self.cfg.base}/availability", "online", True)
 
-    # -- handlers
+    # -- discovery
 
-    def on_connect(self, client, userdata, flags, reason_code, properties=None):
-        log.info("MQTT connected: %s", reason_code)
-        client.subscribe(f"{BASE}/+/+/set")
-        client.subscribe(f"{BASE}/+/set")
-        self.publish_discovery()
+    def publish_discovery(self):
+        cfg = self.cfg
+        device = {
+            "identifiers": [f"xiongmai_{cfg.name}"],
+            "name": cfg.device_name or cfg.name,
+            "manufacturer": "Xiongmai",
+            "model": cfg.model,
+            "configuration_url": f"http://{cfg.host}",
+        }
+        if cfg.area:
+            device["suggested_area"] = cfg.area
+        availability = {
+            "availability": [f"{cfg.base}/availability", BRIDGE_AVAILABILITY],
+            "availability_mode": "all",
+            "payload_available": "online",
+            "payload_not_available": "offline",
+        }
 
-    def on_message(self, client, userdata, msg):
-        rest = msg.topic[len(BASE) + 1:].split("/")
-        if not rest or rest[-1] != "set":
-            return
-        parts = rest[:-1]
-        log.info("cmd %s -> %s", msg.topic, msg.payload)
-        try:
-            with self.lock:
-                if parts[0] == "ptz" and len(parts) == 2:
-                    command = parts[1]
-                    if command in ("Reset",):
-                        with_cam(lambda c: c.ptz(command))
-                    else:
-                        # bounded move: the camera has no separate stop command
-                        with_cam(lambda c: move(c, command, PTZ_IMPULSE))
-                elif parts[0] == "preset" and len(parts) == 2:
-                    with_cam(lambda c: goto_preset(c, int(parts[1]),
-                                                   approach=PTZ_APPROACH or None,
-                                                   settle=PRESET_SETTLE,
-                                                   nudge=PRESET_NUDGE))
-                elif parts[0] == "osd_title":
-                    state = with_cam(lambda c: set_osd(
-                        c, "ChannelTitleEnable", msg.payload.decode() == "ON"))
-                    self.publish_state(state)
-                elif parts[0] == "osd_time":
-                    state = with_cam(lambda c: set_osd(
-                        c, "TimeTitleEnable", msg.payload.decode() == "ON"))
-                    self.publish_state(state)
-                elif parts[0] == "volume":
-                    state = with_cam(lambda c: set_volume(c, float(msg.payload)))
-                    self.publish_state(state)
-                elif parts[0] == "white_light":
-                    state = with_cam(lambda c: set_white_light(c, float(msg.payload)))
-                    self.publish_state(state)
+        def disco(component, object_id, payload):
+            topic = f"{DISCOVERY_PREFIX}/{component}/{cfg.name}/{object_id}/config"
+            self.publish(topic, json.dumps({**payload, "device": device, **availability}), True)
+
+        if self.has_ptz:
+            for command, name, icon in DIRECTION_BUTTONS:
+                disco("button", f"ptz_{command.lower()}", {
+                    "name": cfg.label(f"ptz_{command.lower()}", name),
+                    "unique_id": f"xiongmai_{cfg.name}_ptz_{command.lower()}",
+                    "command_topic": f"{cfg.base}/ptz/{command}/set",
+                    "payload_press": "PRESS", "icon": icon})
+            disco("button", "ptz_home", {
+                "name": cfg.label("ptz_home", "PTZ home"),
+                "unique_id": f"xiongmai_{cfg.name}_ptz_home",
+                "command_topic": f"{cfg.base}/ptz/Reset/set",
+                "payload_press": "PRESS", "icon": "mdi:home-import-outline"})
+            for slot, preset_label in sorted(cfg.presets.items()):
+                disco("button", f"preset_{slot}", {
+                    "name": f"{cfg.label('preset_prefix', 'Preset')} {preset_label}",
+                    "unique_id": f"xiongmai_{cfg.name}_preset_{slot}",
+                    "command_topic": f"{cfg.base}/preset/{slot}/set",
+                    "payload_press": "PRESS", "icon": "mdi:bookmark"})
+
+        feats = self.features or {}
+        for key, name, icon in (("osd_title", "OSD channel title", "mdi:format-text"),
+                                ("osd_time", "OSD time", "mdi:clock-outline")):
+            if feats.get(key):
+                disco("switch", key, {
+                    "name": cfg.label(key, name),
+                    "unique_id": f"xiongmai_{cfg.name}_{key}",
+                    "command_topic": f"{cfg.base}/{key}/set",
+                    "state_topic": f"{cfg.base}/{key}/state",
+                    "payload_on": "ON", "payload_off": "OFF", "icon": icon})
+
+        if feats.get("volume"):
+            disco("number", "volume", {
+                "name": cfg.label("volume", "Speaker volume"),
+                "unique_id": f"xiongmai_{cfg.name}_volume",
+                "command_topic": f"{cfg.base}/volume/set",
+                "state_topic": f"{cfg.base}/volume/state",
+                "min": 0, "max": 100, "step": 1, "mode": "slider",
+                "icon": "mdi:volume-high", "unit_of_measurement": "%"})
+
+        if feats.get("white_light"):
+            disco("number", "white_light", {
+                "name": cfg.label("white_light", "White light brightness"),
+                "unique_id": f"xiongmai_{cfg.name}_white_light",
+                "command_topic": f"{cfg.base}/white_light/set",
+                "state_topic": f"{cfg.base}/white_light/state",
+                "min": 0, "max": 100, "step": 1, "mode": "slider",
+                "icon": "mdi:light-flood-down", "unit_of_measurement": "%"})
+
+        self.publish(f"{cfg.base}/state", json.dumps(self.state), True)
+        self.discovered = True
+
+    # -- writes
+
+    def _set_osd(self, cam, field, value):
+        fvideo = cam.get_config("fVideo") or {}
+        fvideo.setdefault("GUISet", {})[field] = bool(value)
+        cam.set_config("fVideo", fvideo)
+        return self.read_state()      # read back: publish only confirmed values
+
+    def _set_volume(self, cam, value):
+        fvideo = cam.get_config("fVideo") or {}
+        for key in ("Volume", "VolumeIn"):
+            for item in fvideo.get(key) or []:
+                item["LeftVolume"] = item["RightVolume"] = int(value)
+        cam.set_config("fVideo", fvideo)
+        return self.read_state()
+
+    def _set_white_light(self, cam, value):
+        camera = cam.get_config("Camera") or {}
+        camera.setdefault("WhiteLight", {})["Brightness"] = int(value)
+        cam.set_config("Camera", camera)
+        return self.read_state()
+
+    # -- commands
+
+    def handle(self, parts, payload):
+        """Handle one <camera>/... command; returns True when it was understood."""
+        if not parts:
+            return False
+        with self.lock:
+            if parts[0] == "ptz" and len(parts) == 2:
+                command = parts[1]
+                if not self.has_ptz:
+                    log.warning("%s: PTZ disabled by config", self.cfg.name)
+                    return True
+                if command == "Reset":
+                    self.call(lambda cam: cam.ptz("Reset"))
+                elif command in DIRECTIONS:
+                    # bounded impulse: the camera has no separate stop command
+                    self.call(lambda cam: move(cam, command, self.cfg.ptz_impulse))
                 else:
-                    log.warning("unknown topic %s", msg.topic)
-        except Exception as exc:                      # noqa: BLE001
-            log.error("command failed: %s", exc)
-            self.client.publish(f"{BASE}/availability", "offline", retain=True)
+                    log.warning("%s: unknown direction %s", self.cfg.name, command)
+                return True
+            if parts[0] == "preset" and len(parts) == 2:
+                self.call(lambda cam: goto_preset(cam, int(parts[1]),
+                                                  approach=self.cfg.approach or None,
+                                                  settle=self.cfg.preset_settle,
+                                                  nudge=self.cfg.preset_nudge))
+                return True
+            if parts[0] == "osd_title" and len(parts) == 1:
+                self.publish_state(self.call(lambda cam: self._set_osd(
+                    cam, "ChannelTitleEnable", payload.decode() == "ON")))
+                return True
+            if parts[0] == "osd_time" and len(parts) == 1:
+                self.publish_state(self.call(lambda cam: self._set_osd(
+                    cam, "TimeTitleEnable", payload.decode() == "ON")))
+                return True
+            if parts[0] == "volume" and len(parts) == 1:
+                self.publish_state(self.call(lambda cam: self._set_volume(
+                    cam, float(payload))))
+                return True
+            if parts[0] == "white_light" and len(parts) == 1:
+                self.publish_state(self.call(lambda cam: self._set_white_light(
+                    cam, float(payload))))
+                return True
+        return False
 
     # -- loop
 
-    def poll_forever(self):
+    def run(self):
         while True:
             try:
-                state = with_cam(read_state)
-                with self.lock:
-                    self.state = state
-                    self.publish_state(state)
-            except Exception as exc:                  # noqa: BLE001
-                log.warning("poll failed: %s", exc)
-                self.client.publish(f"{BASE}/availability", "offline", retain=True)
-            time.sleep(POLL_SECONDS)
+                if not self.discovered:
+                    self.probe()
+                    self.publish_discovery()
+                state = self.read_state()
+                self.state = state
+                self.publish_state(state)
+            except Exception as exc:                      # noqa: BLE001
+                log.warning("%s: poll failed: %s", self.cfg.name, exc)
+                self.publish(f"{self.cfg.base}/availability", "offline", True)
+            time.sleep(self.cfg.poll_seconds)
+
+
+class Bridge:
+    def __init__(self, cameras):
+        self.cameras = cameras
+        self.workers = {cfg.name: CameraWorker(cfg, self.publish) for cfg in cameras}
+        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+                                  client_id="xiongmai-bridge")
+        if MQTT_USER:
+            self.client.username_pw_set(MQTT_USER, MQTT_PASS)
+        self.client.will_set(BRIDGE_AVAILABILITY, "offline", retain=True)
+        self.client.on_connect = self.on_connect
+        self.client.on_message = self.on_message
+
+    def publish(self, topic, payload, retain=False):
+        self.client.publish(topic, payload, retain=retain)
+
+    def on_connect(self, client, userdata, flags, reason_code, properties=None):
+        log.info("MQTT connected: %s (%d camera(s))", reason_code, len(self.workers))
+        self.publish(BRIDGE_AVAILABILITY, "online", True)
+        # <camera>/<key>/set and <camera>/<group>/<value>/set
+        client.subscribe("xiongmai/+/+/set")
+        client.subscribe("xiongmai/+/+/+/set")
+        for worker in self.workers.values():
+            if worker.discovered:
+                worker.publish_discovery()
+
+    def on_message(self, client, userdata, msg):
+        rest = msg.topic.split("/")[1:]        # drop the leading "xiongmai"
+        if len(rest) < 3 or rest[-1] != "set":
+            return
+        name, parts = rest[0], rest[1:-1]
+        worker = self.workers.get(name)
+        if worker is None:
+            log.warning("unknown camera in topic %s", msg.topic)
+            return
+        log.info("%s: cmd %s -> %s", name, msg.topic, msg.payload)
+        try:
+            if not worker.handle(parts, msg.payload):
+                log.warning("%s: unknown topic %s", name, msg.topic)
+        except Exception as exc:                          # noqa: BLE001
+            log.error("%s: command failed: %s", name, exc)
+            self.publish(f"{worker.cfg.base}/availability", "offline", True)
 
     def run(self):
         self.client.connect(MQTT_HOST, MQTT_PORT, 60)
         self.client.loop_start()
-        threading.Thread(target=self.poll_forever, daemon=True).start()
+        for worker in self.workers.values():
+            threading.Thread(target=worker.run, daemon=True,
+                             name=f"cam-{worker.cfg.name}").start()
         while True:
             time.sleep(3600)
 
 
 def main():
-    Bridge().run()
+    cameras = load_cameras()
+    log.info("configured cameras: %s", ", ".join(c.name for c in cameras))
+    Bridge(cameras).run()
 
 
 if __name__ == "__main__":

@@ -72,9 +72,37 @@ python -m xiongmai_bridge.bridge
 must be enabled, as usual for MQTT). The device is named by `DEVICE_NAME`, the
 topic and `entity_id` prefix come from `CAM_NAME`.
 
+## Several cameras
+
+One process serves all cameras; each gets its own poll thread, command lock, MQTT
+topics and Home Assistant device, so a slow preset move on one camera never
+delays another and an offline camera only takes itself offline.
+
+```yaml
+# cameras.yml  (mount it and set CAMERAS_FILE=/config/cameras.yml)
+cameras:
+  - name: bedroom
+    host: 192.168.1.63
+    secret_file: cameras.json      # JSON with per-camera credentials
+    secret_key: bedroom
+    device_name: Bedroom camera
+    area: Bedroom
+    presets: {"1": "Bed"}
+  - name: hall
+    host: 192.168.1.61
+    password_env: HALL_PASS
+    device_name: Hall camera
+```
+
+`name` is the MQTT topic segment and the `entity_id` prefix. Entities for
+features a camera does not have (no speaker, no white light, no PTZ) are not
+published at all, so the same image fits different models.
+Full reference: [docs/configuration.md](docs/configuration.md).
+
 ## Configuration
 
-Everything is environment variables; `env.example` is the annotated list.
+Everything is environment variables or a cameras file; `env.example` is the
+annotated list.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -129,6 +157,8 @@ few pixels of a 640x360 frame. It costs about 12 seconds per preset press.
 
 ## Documentation
 
+* [docs/configuration.md](docs/configuration.md) — one or many cameras, credential
+  sources, per-camera options, topics, availability, one-process vs one-container.
 * [docs/protocol.md](docs/protocol.md) — DVRIP framing, login hash, message
   types, config sections, PTZ command table, RTSP URLs.
 * [docs/ptz-presets.md](docs/ptz-presets.md) — how presets are stored inside the
