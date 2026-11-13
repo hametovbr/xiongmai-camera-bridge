@@ -49,7 +49,18 @@ def test_yaml_file_with_secret_file(tmp_path):
         "    presets: {1: Bed}\n")
     (cam,) = load({"CAMERAS_FILE": str(cfg)})
     assert cam.password == "pw" and cam.host == "10.0.0.5"
+    # the login user comes from the same secret object unless set explicitly
+    assert cam.user == "urfn"
     assert cam.presets == {1: "Bed"}
+
+
+def test_explicit_user_wins_over_secret(tmp_path):
+    (tmp_path / "s.json").write_text(json.dumps({"cam": {"user": "secretuser", "password": "pw"}}))
+    cfg = tmp_path / "cameras.yml"
+    cfg.write_text("cameras:\n"
+                   "  - {name: cam, host: h, user: explicit, secret_file: s.json, secret_key: cam}\n")
+    (cam,) = load({"CAMERAS_FILE": str(cfg)})
+    assert cam.user == "explicit" and cam.password == "pw"
 
 
 def test_password_from_env_variable():

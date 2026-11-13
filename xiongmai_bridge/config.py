@@ -114,21 +114,23 @@ def _read_secret(secret_file, secret_key, base_dir):
     return node
 
 
-def _password(entry, env, base_dir):
-    if entry.get("password"):
-        return str(entry["password"])
-    if entry.get("password_env"):
-        value = env.get(entry["password_env"])
-        if not value:
-            raise ConfigError(f"environment variable {entry['password_env']} is empty")
-        return value
+def _credentials(entry, env, base_dir):
+    """Return (user, password); a secret object may carry both fields."""
+    secret = {}
     if entry.get("secret_file"):
-        node = _read_secret(entry["secret_file"], entry.get("secret_key", ""), base_dir)
-        value = node.get("password")
-        if not value:
-            raise ConfigError(f"secret {entry.get('secret_key')!r} has no password")
-        return str(value)
-    raise ConfigError("no password source: use password, password_env or secret_file")
+        secret = _read_secret(entry["secret_file"], entry.get("secret_key", ""), base_dir)
+    if entry.get("password"):
+        password = str(entry["password"])
+    elif entry.get("password_env"):
+        password = env.get(entry["password_env"])
+        if not password:
+            raise ConfigError(f"environment variable {entry['password_env']} is empty")
+    elif secret.get("password"):
+        password = str(secret["password"])
+    else:
+        raise ConfigError("no password source: use password, password_env or secret_file")
+    user = entry.get("user") or secret.get("user") or env.get("CAM_USER", "admin")
+    return str(user), password
 
 
 def _merge(defaults, entry):
@@ -150,7 +152,7 @@ def from_mapping(entry, defaults=None, env=None, base_dir="."):
         name=name,
         host=str(data.get("host") or ""),
         password="",
-        user=str(data.get("user") or env.get("CAM_USER", "admin")),
+        user="",
         port=int(data.get("port") or env.get("CAM_PORT", 34567)),
         device_name=str(data.get("device_name") or data.get("name") or ""),
         model=str(data.get("model") or env.get("DEVICE_MODEL", "Xiongmai IP camera")),
@@ -168,7 +170,7 @@ def from_mapping(entry, defaults=None, env=None, base_dir="."):
         white_light=data.get("white_light"),
     )
     try:
-        cfg.password = _password(data, env, base_dir)
+        cfg.user, cfg.password = _credentials(data, env, base_dir)
     except ConfigError as exc:
         raise ConfigError(f"camera {name or '<unnamed>'}: {exc}") from exc
     return cfg.validate()

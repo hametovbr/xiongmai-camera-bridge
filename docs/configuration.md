@@ -74,7 +74,9 @@ create a new device.
 
 Credential sources: `password` inline (only for throwaway setups), `password_env`
 (name of an environment variable), or `secret_file` + `secret_key` pointing into
-a JSON file such as `.secrets/cameras.json`. The secret file path is resolved
+a JSON file such as `.secrets/cameras.json`. A secret object may contain the login
+too (`{"bedroom": {"user": "urfn", "password": "..."}}`) — it is used unless the
+camera sets `user` explicitly, so credentials live in one place. The secret file path is resolved
 relative to the directory of the cameras file, so mounting both into the
 container keeps them side by side.
 
