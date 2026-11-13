@@ -1,0 +1,12 @@
+services:
+  xiongmai-camera:
+    build: .
+    container_name: xiongmai-camera
+    restart: unless-stopped
+    env_file:
+      - .env
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
