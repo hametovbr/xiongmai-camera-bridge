@@ -24,6 +24,11 @@
   change; a deleted button is removed with an empty retained payload on its
   exact discovery topic.
 
+### Fixed
+- `xiongmai-ptz mark` crashed with `AttributeError: 'Namespace' object has no
+  attribute 'stream'` — the `--stream` option existed only on `check` while the
+  shared frame-grabbing path reads it for both; `mark` now accepts `--stream`.
+
 ### Compatibility
 - 0.2.2 configs load unchanged; `auto_presets: false` keeps the exact 0.2.2
   entity set; existing `unique_id`s and the `preset/<slot>/set` topic are

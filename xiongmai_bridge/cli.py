@@ -54,6 +54,7 @@ def main(argv=None):
 
     p_mark = sub.add_parser("mark", help="save a reference frame of this view")
     p_mark.add_argument("slot", type=int)
+    p_mark.add_argument("--stream", type=int, default=1, help="0 = main, 1 = sub")
 
     p_check = sub.add_parser("check", help="compare the live view with the reference")
     p_check.add_argument("slot", type=int)
