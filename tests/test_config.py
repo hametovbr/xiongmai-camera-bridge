@@ -95,3 +95,79 @@ def test_duplicate_camera_names_are_rejected():
         {"name": "cam", "host": "h2", "password": "p"}])}
     with pytest.raises(ConfigError, match="duplicate"):
         load(env)
+
+
+# -- preset control keys (v0.3.0) -------------------------------------------
+
+
+def _cam(**extra):
+    entry = {"name": "cam", "host": "h", "password": "p"}
+    entry.update(extra)
+    return {"CAMERAS": json.dumps([entry])}
+
+
+def test_preset_control_defaults():
+    (cam,) = load(_cam())
+    assert cam.auto_presets is True
+    assert cam.preset_slots == [1, 2, 3, 4]
+    assert cam.max_presets == 12
+
+
+def test_legacy_config_without_new_keys_is_valid():
+    # a 0.2.2 entry keeps loading; auto_presets defaults on, opt-out is explicit
+    (cam,) = load(_cam(presets={"1": "Bed", "2": "Door"}))
+    assert cam.presets == {1: "Bed", 2: "Door"}
+    (legacy,) = load(_cam(auto_presets=False))
+    assert legacy.auto_presets is False
+
+
+@pytest.mark.parametrize("slots", [
+    [100], [128], [141], [250], [255],   # reserved / outside the table
+    [0], [256], [-1],                    # out of range (same rule as presets)
+    ["x"], [1, "y"],                     # not numbers
+    [1, 128],                            # one bad entry poisons the list
+])
+def test_invalid_preset_slots_are_rejected(slots):
+    with pytest.raises(ConfigError):
+        load(_cam(preset_slots=slots))
+
+
+def test_empty_preset_slots_is_rejected():
+    with pytest.raises(ConfigError, match="empty"):
+        load(_cam(preset_slots=[]))
+
+
+def test_preset_slots_duplicates_are_dropped():
+    (cam,) = load(_cam(preset_slots=[3, 1, 3, 2, 1]))
+    assert cam.preset_slots == [1, 2, 3]
+
+
+def test_preset_slots_not_a_list_is_rejected():
+    with pytest.raises(ConfigError):
+        load(_cam(preset_slots="1,2"))
+
+
+@pytest.mark.parametrize("value", [0, -3])
+def test_max_presets_must_be_positive(value):
+    with pytest.raises(ConfigError, match="max_presets"):
+        load(_cam(max_presets=value))
+
+
+def test_presets_outside_whitelist_are_allowed():
+    # goto stays allowed for config presets; only save/delete use the whitelist
+    (cam,) = load(_cam(presets={"5": "Window"}, preset_slots=[1, 2]))
+    assert cam.presets == {5: "Window"}
+    assert cam.preset_slots == [1, 2]
+
+
+def test_preset_control_keys_merge_from_defaults():
+    env = {"CAMERAS": json.dumps({
+        "defaults": {"preset_slots": [1, 2], "max_presets": 6,
+                     "labels": {"preset_auto_prefix": "Пресет"}},
+        "cameras": [{"name": "a", "host": "h", "password": "p"},
+                    {"name": "b", "host": "h", "password": "p",
+                     "preset_slots": [7, 8]}]})}
+    a, b = load(env)
+    assert a.preset_slots == [1, 2] and a.max_presets == 6
+    assert b.preset_slots == [7, 8] and b.max_presets == 6
+    assert a.label("preset_auto_prefix", "Preset") == "Пресет"

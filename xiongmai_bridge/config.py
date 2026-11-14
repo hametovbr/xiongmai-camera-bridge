@@ -65,6 +65,11 @@ class CameraConfig:
     osd: object = None
     volume: object = None
     white_light: object = None
+    # Preset control (v0.3.0): auto-discovery of camera slots plus save/delete
+    # from Home Assistant. auto_presets=False keeps the exact 0.2.2 behaviour.
+    auto_presets: bool = True
+    preset_slots: list = field(default_factory=lambda: [1, 2, 3, 4])
+    max_presets: int = 12
 
     @property
     def base(self):
@@ -93,6 +98,25 @@ class CameraConfig:
                 raise ConfigError(f"camera {self.name}: preset slot {slot} is reserved "
                                   f"or out of range (1..254, not {sorted(RESERVED_SLOTS)})")
         self.presets = {int(k): str(v) for k, v in self.presets.items()}
+        # preset_slots is the save/delete whitelist; the same slot rules as
+        # presets and ptz.check_slot apply (three-level protection).
+        if not isinstance(self.preset_slots, (list, tuple)):
+            raise ConfigError(f"camera {self.name}: preset_slots must be a list of slot numbers")
+        slots = []
+        for slot in self.preset_slots:
+            try:
+                number = int(slot)
+            except (TypeError, ValueError):
+                raise ConfigError(f"camera {self.name}: preset_slots entry {slot!r} is not a number")
+            if number in RESERVED_SLOTS or not 1 <= number <= 254:
+                raise ConfigError(f"camera {self.name}: preset_slots slot {number} is reserved "
+                                  f"or out of range (1..254, not {sorted(RESERVED_SLOTS)})")
+            slots.append(number)
+        if not slots:
+            raise ConfigError(f"camera {self.name}: preset_slots must not be empty")
+        self.preset_slots = sorted(set(slots))
+        if self.max_presets < 1:
+            raise ConfigError(f"camera {self.name}: max_presets must be >= 1")
         return self
 
 
@@ -168,6 +192,10 @@ def from_mapping(entry, defaults=None, env=None, base_dir="."):
         osd=data.get("osd"),
         volume=data.get("volume"),
         white_light=data.get("white_light"),
+        auto_presets=bool(data.get("auto_presets", True)),
+        preset_slots=([1, 2, 3, 4] if data.get("preset_slots") is None
+                      else data.get("preset_slots")),
+        max_presets=int(data.get("max_presets", 12)),
     )
     try:
         cfg.user, cfg.password = _credentials(data, env, base_dir)
