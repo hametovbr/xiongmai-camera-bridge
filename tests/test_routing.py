@@ -157,6 +157,25 @@ def test_restore_ignores_empty_and_invalid(worker):
     assert w.selected_slot is None
 
 
+def test_restore_same_value_is_silent(worker, caplog):
+    # the bridge receives its own retained slot/state on every poll: no log spam
+    w, _, published = worker
+    w.selected_slot = 2
+    with caplog.at_level(logging.INFO, logger="xiongmai-bridge"):
+        w.restore_selected_slot(b"2")
+    assert published == []
+    assert not any("restored" in r.getMessage() for r in caplog.records)
+
+
+def test_slot_state_published_once_per_value(worker):
+    w, _, published = worker
+    w.selected_slot = 3
+    w.publish_preset_state()
+    w.publish_preset_state()
+    slot_states = [t for t, p, r in published if t.endswith("preset_ctl/slot/state")]
+    assert len(slot_states) == 1
+
+
 # -- save --------------------------------------------------------------------
 
 

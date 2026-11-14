@@ -85,6 +85,7 @@ class CameraWorker:
         self.last_error = None
         self.published_slots = set()          # preset buttons live in discovery
         self._last_options = []               # select options live in discovery
+        self._published_slot = None           # last slot/state value we published
 
     # -- connection helpers
 
@@ -329,9 +330,10 @@ class CameraWorker:
         self.publish(f"{cfg.base}/preset_ctl/slots/state",
                      json.dumps(slots_state(cfg, self.occupied,
                                             self.last_action, self.last_error)), True)
-        if self.selected_slot is not None:
+        if self.selected_slot is not None and self.selected_slot != self._published_slot:
             self.publish(f"{cfg.base}/preset_ctl/slot/state",
                          str(self.selected_slot), True)
+            self._published_slot = self.selected_slot
 
     # -- writes
 
@@ -365,6 +367,7 @@ class CameraWorker:
             return
         self.selected_slot = slot
         self.publish(f"{self.cfg.base}/preset_ctl/slot/state", str(slot), True)
+        self._published_slot = slot
         log.info("%s: preset slot selected: %d", self.cfg.name, slot)
 
     def restore_selected_slot(self, payload):
@@ -372,6 +375,8 @@ class CameraWorker:
         try:
             slot = check_slot(payload.decode().strip())
         except (ValueError, UnicodeDecodeError):
+            return
+        if slot == self.selected_slot:
             return
         self.selected_slot = slot
         log.info("%s: preset slot restored from retained state: %d", self.cfg.name, slot)
