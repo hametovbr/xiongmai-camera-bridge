@@ -84,6 +84,7 @@ class CameraWorker:
         self.last_action = None
         self.last_error = None
         self.published_slots = set()          # preset buttons live in discovery
+        self._last_options = []               # select options live in discovery
 
     # -- connection helpers
 
@@ -281,12 +282,13 @@ class CameraWorker:
         """select / save / delete / sensor for preset management (v0.3.0)."""
         cfg = self.cfg
         base = f"{cfg.base}/preset_ctl"
+        self._last_options = select_options(cfg, self.occupied)
         disco("select", "preset_slot", {
             "name": cfg.label("preset_slot", "Preset slot"),
             "unique_id": f"xiongmai_{cfg.name}_preset_slot",
             "command_topic": f"{base}/slot/set",
             "state_topic": f"{base}/slot/state",
-            "options": select_options(cfg, self.occupied),
+            "options": self._last_options,
             "entity_category": "config",
             "icon": "mdi:bookmark-box-multiple"})
         disco("button", "preset_save", {
@@ -343,6 +345,93 @@ class CameraWorker:
         cam.set_config("Camera", camera)
         return self.read_state()
 
+    # -- preset control (v0.3.0)
+
+    def _select_slot(self, payload):
+        try:
+            slot = check_slot(payload.decode().strip())
+        except (ValueError, UnicodeDecodeError):
+            log.warning("%s: invalid slot selection %r, ignored", self.cfg.name, payload)
+            return
+        self.selected_slot = slot
+        self.publish(f"{self.cfg.base}/preset_ctl/slot/state", str(slot), True)
+        log.info("%s: preset slot selected: %d", self.cfg.name, slot)
+
+    def restore_selected_slot(self, payload):
+        """Retained preset_ctl/slot/state replay: restore without republishing."""
+        try:
+            slot = check_slot(payload.decode().strip())
+        except (ValueError, UnicodeDecodeError):
+            return
+        self.selected_slot = slot
+        log.info("%s: preset slot restored from retained state: %d", self.cfg.name, slot)
+
+    def _preset_save(self):
+        cfg = self.cfg
+        slot = self.selected_slot
+        if slot is None or slot not in cfg.preset_slots:
+            self._preset_error("save", slot, "no valid slot selected (use the select entity)")
+            return
+        try:
+            def work(cam):
+                # same gear-loading approach as goto, so the stored counters
+                # match what goto_preset() will reproduce later
+                save_preset(cam, slot, approach=cfg.approach or None,
+                            nudge=cfg.preset_nudge)
+                return list_slots(cam)
+            self.occupied = valid_slots(self.call(work))
+        except (DvripError, ValueError) as exc:
+            self._preset_error("save", slot, str(exc))
+            return
+        self.last_action = {"kind": "save", "slot": slot, "result": "ok", "ts": utc_ts()}
+        self.last_error = None
+        log.info("%s: preset saved to slot %d", cfg.name, slot)
+        self._republish_presets()
+
+    def _preset_delete(self):
+        cfg = self.cfg
+        slot = self.selected_slot
+        if slot is None or slot not in cfg.preset_slots:
+            self._preset_error("delete", slot, "no valid slot selected (use the select entity)")
+            return
+        try:
+            def work(cam):
+                clear_preset(cam, slot)
+                return list_slots(cam)
+            self.occupied = valid_slots(self.call(work))
+        except (DvripError, ValueError) as exc:
+            self._preset_error("delete", slot, str(exc))
+            return
+        if slot not in self.occupied:
+            log.info("%s: preset slot %d is empty (delete is idempotent)", cfg.name, slot)
+        self.last_action = {"kind": "delete", "slot": slot, "result": "ok", "ts": utc_ts()}
+        self.last_error = None
+        log.info("%s: preset deleted from slot %d", cfg.name, slot)
+        self._republish_presets()
+
+    def _preset_error(self, kind, slot, message):
+        self.last_error = {"kind": kind, "slot": slot, "message": message, "ts": utc_ts()}
+        log.warning("%s: preset %s failed: %s", self.cfg.name, kind, message)
+        self.publish_preset_state()
+
+    def _republish_presets(self):
+        """Republish discovery only when the button set or select options changed.
+
+        A removed button is cleared with an empty retained payload on its exact
+        discovery topic — that is how Home Assistant deletes the entity.
+        """
+        cfg = self.cfg
+        new_slots = set(published_slots(cfg, self.occupied))
+        new_options = select_options(cfg, self.occupied)
+        for slot in sorted(self.published_slots - new_slots):
+            self.publish(f"{DISCOVERY_PREFIX}/button/{cfg.name}/preset_{slot}/config",
+                         "", True)
+            log.info("%s: preset button %d removed from discovery", cfg.name, slot)
+        if new_slots != self.published_slots or new_options != self._last_options:
+            self.publish_discovery()          # includes the retained preset state
+        else:
+            self.publish_preset_state()
+
     # -- commands
 
     def handle(self, parts, payload):
@@ -364,10 +453,32 @@ class CameraWorker:
                     log.warning("%s: unknown direction %s", self.cfg.name, command)
                 return True
             if parts[0] == "preset" and len(parts) == 2:
-                self.call(lambda cam: goto_preset(cam, int(parts[1]),
+                try:
+                    slot = check_slot(parts[1])
+                except ValueError:
+                    # non-numeric or reserved: ignore, do not crash the router
+                    # and do not mark the camera offline for a bad topic
+                    log.warning("%s: invalid preset slot %r, ignored",
+                                self.cfg.name, parts[1])
+                    return True
+                self.call(lambda cam: goto_preset(cam, slot,
                                                   approach=self.cfg.approach or None,
                                                   settle=self.cfg.preset_settle,
                                                   nudge=self.cfg.preset_nudge))
+                return True
+            if parts[0] == "preset_ctl" and len(parts) == 2:
+                if not (self.has_ptz and self.cfg.auto_presets and self.cfg.preset_slots):
+                    log.warning("%s: preset control disabled by config", self.cfg.name)
+                    return True
+                action = parts[1]
+                if action == "slot":
+                    self._select_slot(payload)
+                elif action == "save":
+                    self._preset_save()
+                elif action == "delete":
+                    self._preset_delete()
+                else:
+                    log.warning("%s: unknown preset_ctl action %s", self.cfg.name, action)
                 return True
             if parts[0] == "osd_title" and len(parts) == 1:
                 self.publish_state(self.call(lambda cam: self._set_osd(
@@ -425,12 +536,21 @@ class Bridge:
         # <camera>/<key>/set and <camera>/<group>/<value>/set
         client.subscribe("xiongmai/+/+/set")
         client.subscribe("xiongmai/+/+/+/set")
+        # retained select state: restores the selection after a restart
+        client.subscribe("xiongmai/+/preset_ctl/slot/state")
         for worker in self.workers.values():
             if worker.discovered:
                 worker.publish_discovery()
 
     def on_message(self, client, userdata, msg):
         rest = msg.topic.split("/")[1:]        # drop the leading "xiongmai"
+        # retained select state replay (not a command): restore the selection
+        if (len(rest) == 4 and rest[1] == "preset_ctl"
+                and rest[2] == "slot" and rest[3] == "state"):
+            worker = self.workers.get(rest[0])
+            if worker is not None:
+                worker.restore_selected_slot(msg.payload)
+            return
         if len(rest) < 3 or rest[-1] != "set":
             return
         name, parts = rest[0], rest[1:-1]
