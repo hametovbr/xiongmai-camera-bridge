@@ -40,7 +40,10 @@ import paho.mqtt.client as mqtt
 
 from .config import load as load_cameras
 from .dvrip import Dvrip, DvripError
-from .ptz import DIRECTIONS, goto_preset, move
+from .presets import (published_slots, select_options, slot_label, slots_state,
+                      utc_ts, valid_slots)
+from .ptz import (DIRECTIONS, check_slot, clear_preset, goto_preset, list_slots,
+                  move, save_preset)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -75,6 +78,12 @@ class CameraWorker:
         self.state = {}
         self.features = None                  # filled by probe()
         self.discovered = False
+        # preset control (v0.3.0): camera truth + select state + last result
+        self.occupied = set()                 # usable slots reported by the camera
+        self.selected_slot = None             # current preset_ctl select value
+        self.last_action = None
+        self.last_error = None
+        self.published_slots = set()          # preset buttons live in discovery
 
     # -- connection helpers
 
@@ -128,6 +137,7 @@ class CameraWorker:
                 else:
                     feats[key] = enabled
         self.features = feats
+        self.occupied = valid_slots(feats.get("slots"))
         log.info("%s: features %s", self.cfg.name,
                  {k: v for k, v in feats.items() if k != "slots"})
         return feats
@@ -215,12 +225,23 @@ class CameraWorker:
                 "unique_id": f"xiongmai_{cfg.name}_ptz_home",
                 "command_topic": f"{cfg.base}/ptz/Reset/set",
                 "payload_press": "PRESS", "icon": "mdi:home-import-outline"})
-            for slot, preset_label in sorted(cfg.presets.items()):
+            if cfg.auto_presets:
+                slots = published_slots(cfg, self.occupied)
+            else:
+                slots = sorted(cfg.presets)   # legacy 0.2.2: config only
+            for slot in slots:
+                if slot in cfg.presets:
+                    name = f"{cfg.label('preset_prefix', 'Preset')} {cfg.presets[slot]}"
+                else:
+                    name = slot_label(cfg, slot)
                 disco("button", f"preset_{slot}", {
-                    "name": f"{cfg.label('preset_prefix', 'Preset')} {preset_label}",
+                    "name": name,
                     "unique_id": f"xiongmai_{cfg.name}_preset_{slot}",
                     "command_topic": f"{cfg.base}/preset/{slot}/set",
                     "payload_press": "PRESS", "icon": "mdi:bookmark"})
+            self.published_slots = set(slots)
+            if cfg.auto_presets and cfg.preset_slots:
+                self._publish_preset_controls(disco)
 
         feats = self.features or {}
         for key, name, icon in (("osd_title", "OSD channel title", "mdi:format-text"),
@@ -252,7 +273,53 @@ class CameraWorker:
                 "icon": "mdi:light-flood-down", "unit_of_measurement": "%"})
 
         self.publish(f"{cfg.base}/state", json.dumps(self.state), True)
+        if self.has_ptz and cfg.auto_presets and cfg.preset_slots:
+            self.publish_preset_state()
         self.discovered = True
+
+    def _publish_preset_controls(self, disco):
+        """select / save / delete / sensor for preset management (v0.3.0)."""
+        cfg = self.cfg
+        base = f"{cfg.base}/preset_ctl"
+        disco("select", "preset_slot", {
+            "name": cfg.label("preset_slot", "Preset slot"),
+            "unique_id": f"xiongmai_{cfg.name}_preset_slot",
+            "command_topic": f"{base}/slot/set",
+            "state_topic": f"{base}/slot/state",
+            "options": select_options(cfg, self.occupied),
+            "entity_category": "config",
+            "icon": "mdi:bookmark-box-multiple"})
+        disco("button", "preset_save", {
+            "name": cfg.label("preset_save", "Save preset"),
+            "unique_id": f"xiongmai_{cfg.name}_preset_save",
+            "command_topic": f"{base}/save/set",
+            "payload_press": "PRESS", "entity_category": "config",
+            "icon": "mdi:content-save"})
+        disco("button", "preset_delete", {
+            "name": cfg.label("preset_delete", "Delete preset"),
+            "unique_id": f"xiongmai_{cfg.name}_preset_delete",
+            "command_topic": f"{base}/delete/set",
+            "payload_press": "PRESS", "entity_category": "config",
+            "icon": "mdi:bookmark-remove"})
+        disco("sensor", "preset_slots", {
+            "name": cfg.label("preset_slots", "Preset slots"),
+            "unique_id": f"xiongmai_{cfg.name}_preset_slots",
+            "state_topic": f"{base}/slots/state",
+            "value_template": "{{ value_json.count }}",
+            "json_attributes_topic": f"{base}/slots/state",
+            "json_attributes": ["slots", "free", "managed", "reserved",
+                                "last_action", "last_error"],
+            "icon": "mdi:bookmark-multiple"})
+
+    def publish_preset_state(self):
+        """Retained preset_ctl state: the slots overview and current selection."""
+        cfg = self.cfg
+        self.publish(f"{cfg.base}/preset_ctl/slots/state",
+                     json.dumps(slots_state(cfg, self.occupied,
+                                            self.last_action, self.last_error)), True)
+        if self.selected_slot is not None:
+            self.publish(f"{cfg.base}/preset_ctl/slot/state",
+                         str(self.selected_slot), True)
 
     # -- writes
 
