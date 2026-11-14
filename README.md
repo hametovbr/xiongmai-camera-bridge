@@ -27,27 +27,37 @@ DVRIP (TCP 34567)  <--  xiongmai-camera-bridge  -->  MQTT / Home Assistant disco
 Writes are read back from the camera before the state is published, so Home
 Assistant never shows a value the camera did not accept.
 
+Entities exist only for the capabilities the camera reports: no speaker, no
+floodlight or no PTZ means no such entities. How to add the device, verify it and
+fix a missing one — [docs/home-assistant.md](docs/home-assistant.md).
+
 ## Install
 
 Prebuilt multi-arch images (`linux/amd64`, `linux/arm64`) are published to
 GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/hametovbr/xiongmai-camera-bridge:0.1.0
+docker pull ghcr.io/hametovbr/xiongmai-camera-bridge:0.2.1
 ```
 
-With Compose, drop this next to your `.env`:
+With Compose, drop this next to your `.env` and `cameras.yml`:
 
 ```yaml
 services:
   xiongmai-camera:
-    image: ghcr.io/hametovbr/xiongmai-camera-bridge:0.1.0
+    image: ghcr.io/hametovbr/xiongmai-camera-bridge:0.2.1
     container_name: xiongmai-camera
     restart: unless-stopped
-    env_file: [.env]
+    env_file: [.env]                     # MQTT_HOST/PORT/USER/PASS, CAMERAS_FILE
+    volumes:
+      - ./cameras.yml:/config/cameras.yml:ro
 ```
 
 `edge` tracks `main`, `latest` points at the newest release tag.
+
+Requirements on the HA side: an MQTT broker plus the MQTT integration with
+discovery enabled. Step-by-step, with what you should see and how to diagnose a
+missing device: [docs/home-assistant.md](docs/home-assistant.md).
 
 From source:
 
@@ -157,6 +167,9 @@ few pixels of a 640x360 frame. It costs about 12 seconds per preset press.
 
 ## Documentation
 
+* [docs/home-assistant.md](docs/home-assistant.md) — adding the bridge to Home
+  Assistant: prerequisites, steps, the entity list, verification and
+  troubleshooting.
 * [docs/configuration.md](docs/configuration.md) — one or many cameras, credential
   sources, per-camera options, topics, availability, one-process vs one-container.
 * [docs/protocol.md](docs/protocol.md) — DVRIP framing, login hash, message
