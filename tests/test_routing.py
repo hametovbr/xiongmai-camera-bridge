@@ -24,6 +24,7 @@ class FakeCam:
         self.calls = []
         self._slots = list(slots)
         self.fail_on = None
+        self.fail_get = False
 
     def ptz(self, command, preset=65535, step=1):
         if command == self.fail_on:
@@ -37,6 +38,8 @@ class FakeCam:
 
     def get_config(self, name):
         if name == "Uart":
+            if self.fail_get:
+                raise DvripError("get Uart: Ret=607")
             return {"PTZPreset": [[{"Id": s} for s in self._slots]]}
         raise DvripError(f"get {name}: Ret=607")
 
@@ -285,3 +288,52 @@ def test_bridge_subscribes_and_restores_select(monkeypatch):
     cmd = types.SimpleNamespace(topic="xiongmai/cam/preset_ctl/slot/set", payload=b"2")
     b.on_message(fake_client, None, cmd)
     assert b.workers["cam"].selected_slot == 2
+
+
+# -- poll-driven auto-discovery (T5) ------------------------------------------
+
+
+def test_poll_refresh_adds_app_created_slot(worker):
+    w, fake, published = worker
+    fake._slots.append(5)                    # preset created in the vendor app
+    w.read_state()
+    assert w.occupied == {1, 2, 5}
+    with w.lock:
+        w._republish_presets()
+    assert "homeassistant/button/cam/preset_5/config" in _configs(published)
+
+
+def test_poll_refresh_removes_slot_cleared_in_app(worker):
+    w, fake, published = worker
+    fake._slots.remove(2)
+    w.read_state()
+    assert w.occupied == {1}
+    with w.lock:
+        w._republish_presets()
+    assert ("homeassistant/button/cam/preset_2/config", "", True) in published
+
+
+def test_poll_refresh_filters_reserved(worker):
+    w, fake, published = worker
+    fake._slots.append(100)                  # firmware slot, like the corridor
+    w.read_state()
+    assert w.occupied == {1, 2}
+    with w.lock:
+        w._republish_presets()
+    assert not any("preset_100" in t for t, p, r in published)
+
+
+def test_poll_refresh_keeps_occupied_on_uart_error(worker):
+    w, fake, _ = worker
+    fake.fail_get = True
+    w.read_state()
+    assert w.occupied == {1, 2}              # previous truth kept, no crash
+
+
+def test_poll_no_churn_when_nothing_changed(worker):
+    w, _, published = worker
+    w.read_state()
+    with w.lock:
+        w._republish_presets()
+    assert _configs(published) == []         # discovery untouched
+    assert _state(published, "xiongmai/cam/preset_ctl/slots/state") is not None

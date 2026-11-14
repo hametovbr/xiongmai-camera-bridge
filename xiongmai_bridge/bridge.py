@@ -151,6 +151,7 @@ class CameraWorker:
 
     def read_state(self):
         feats = self.features or {}
+        presets_active = self.has_ptz and self.cfg.auto_presets and self.cfg.preset_slots
 
         def work(cam):
             state = {}
@@ -169,6 +170,15 @@ class CameraWorker:
                 light = camera.get("WhiteLight") or {}
                 state["white_light"] = int(light.get("Brightness", 0))
                 state["white_light_mode"] = light.get("WorkMode", "?")
+            if presets_active:
+                # refresh occupied in the same session: presets created in the
+                # vendor app appear without a bridge restart (kept on error)
+                try:
+                    uart = cam.get_config("Uart") or {}
+                    groups = uart.get("PTZPreset") or [[]]
+                    self.occupied = valid_slots([p.get("Id") for p in groups[0]])
+                except DvripError:
+                    pass
             return state
 
         return self.call(work)
@@ -509,6 +519,10 @@ class CameraWorker:
                 state = self.read_state()
                 self.state = state
                 self.publish_state(state)
+                if self.has_ptz and self.cfg.auto_presets and self.cfg.preset_slots:
+                    with self.lock:
+                        # discovery churns only when the slot set/options changed
+                        self._republish_presets()
             except Exception as exc:                      # noqa: BLE001
                 log.warning("%s: poll failed: %s", self.cfg.name, exc)
                 self.publish(f"{self.cfg.base}/availability", "offline", True)
