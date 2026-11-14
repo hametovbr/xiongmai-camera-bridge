@@ -186,11 +186,17 @@ class CameraWorker:
         }
         if cfg.area:
             device["suggested_area"] = cfg.area
+        # Home Assistant requires a list of mappings here, not a list of topic
+        # strings: `availability: ["topic"]` is rejected with
+        # "expected a mapping at 'availability[0]'" and no entities are created.
         availability = {
-            "availability": [f"{cfg.base}/availability", BRIDGE_AVAILABILITY],
+            "availability": [
+                {"topic": f"{cfg.base}/availability",
+                 "payload_available": "online", "payload_not_available": "offline"},
+                {"topic": BRIDGE_AVAILABILITY,
+                 "payload_available": "online", "payload_not_available": "offline"},
+            ],
             "availability_mode": "all",
-            "payload_available": "online",
-            "payload_not_available": "offline",
         }
 
         def disco(component, object_id, payload):
