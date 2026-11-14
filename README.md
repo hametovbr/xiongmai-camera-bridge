@@ -1,9 +1,10 @@
 # xiongmai-camera-bridge
 
 Turn a cheap Xiongmai / XMeye / iCSee pan-tilt camera into something Home
-Assistant can actually drive: PTZ, presets that come back to the same view, OSD
-switches, speaker volume and white-light brightness — all over the camera's own
-DVRIP protocol (TCP 34567).
+Assistant can actually drive: PTZ, presets that come back to the same view
+(and can be saved/deleted from HA, with auto-discovery of the slots made in
+the vendor app), OSD switches, speaker volume and white-light brightness —
+all over the camera's own DVRIP protocol (TCP 34567).
 
 There is no ONVIF and no HTTP API on these cameras, and the vendor app is the
 only supported client. This project is a small, documented replacement for the
@@ -20,6 +21,8 @@ DVRIP (TCP 34567)  <--  xiongmai-camera-bridge  -->  MQTT / Home Assistant disco
 | `button.*_ptz_directionleft` … | bounded move in one direction, with an explicit stop |
 | `button.*_ptz_reset` | `Reset` — firmware re-centres the head |
 | `button.*_preset_<n>` | return to preset slot `n` (with backlash compensation) |
+| `select.*_preset_slot` + `button.*_preset_save` / `_preset_delete` | save/delete presets from HA (v0.3.0) |
+| `sensor.*_preset_slots` | occupied slots, free whitelist slots, last action/error |
 | `switch.*_osd_title`, `switch.*_osd_time` | on-screen title / clock |
 | `number.*_volume` | speaker volume |
 | `number.*_white_light` | white light brightness |
@@ -37,7 +40,7 @@ Prebuilt multi-arch images (`linux/amd64`, `linux/arm64`) are published to
 GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/hametovbr/xiongmai-camera-bridge:0.2.1
+docker pull ghcr.io/hametovbr/xiongmai-camera-bridge:0.3.0
 ```
 
 With Compose, drop this next to your `.env` and `cameras.yml`:
@@ -45,7 +48,7 @@ With Compose, drop this next to your `.env` and `cameras.yml`:
 ```yaml
 services:
   xiongmai-camera:
-    image: ghcr.io/hametovbr/xiongmai-camera-bridge:0.2.1
+    image: ghcr.io/hametovbr/xiongmai-camera-bridge:0.3.0
     container_name: xiongmai-camera
     restart: unless-stopped
     env_file: [.env]                     # MQTT_HOST/PORT/USER/PASS, CAMERAS_FILE

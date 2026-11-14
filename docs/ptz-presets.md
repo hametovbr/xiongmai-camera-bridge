@@ -146,3 +146,26 @@ a dark scene it stays small even for a clearly shifted picture.
 * Behaviour across a camera reboot is not verified on a live head.
 * There is no way over DVRIP to read the current coordinates or the calibration
   state (`Camera.MotorCtrl` → `Ret: 607`, `Uart.PTZ` has no position fields).
+
+## 8. Save/delete from Home Assistant (v0.3.0)
+
+The bridge exposes `SetPreset`/`ClearPreset` through the `preset_ctl` MQTT
+topics and HA entities (select + save/delete buttons + slots sensor, see
+[configuration.md](configuration.md)):
+
+* **save** runs the same gear-loading approach as goto (a tiny move away and
+  back before `SetPreset`), so the stored counters match what `goto_preset()`
+  reproduces — a point saved from HA comes back within the same ≤ 6 px;
+* **delete** sends `ClearPreset` and re-reads `Uart.PTZPreset`; clearing an
+  empty slot is a success (idempotent). When the slot is neither occupied nor
+  defined in `presets`, its HA button is removed with an empty retained
+  discovery payload;
+* the occupied set is re-read on every poll, so presets created in the vendor
+  app appear automatically. Slots saved by the app without the approach may
+  still be a few dozen pixels off — re-save them from HA (or
+  `xiongmai-ptz save`) to fix the view;
+* reserved slots `100/128/141/250` and out-of-table `255` are rejected at three
+  levels: config load, the MQTT router and `check_slot()` — `SetPreset` /
+  `ClearPreset` are never sent for them;
+* slot names are never written to the camera (`SetConfig Uart` corrupts them);
+  labels live in `cameras.yml`, auto slots are named `<preset_auto_prefix> N`.

@@ -65,6 +65,9 @@ create a new device.
 | `model` | `Xiongmai IP camera` | shown on the HA device page |
 | `area` | empty | `suggested_area` for the HA device (applied on creation) |
 | `presets` | `{}` | slot → label, exposed as buttons; slots must be 1..254 |
+| `auto_presets` | `true` | publish goto buttons for the slots the camera actually has, plus the save/delete controls; `false` keeps the exact 0.2.2 behaviour |
+| `preset_slots` | `[1, 2, 3, 4]` | whitelist of slots for save/delete; same rules as `presets` (1..254, no reserved), duplicates dropped, an explicitly empty list is rejected |
+| `max_presets` | `12` | cap on published preset buttons; the lowest slot numbers win |
 | `labels` | `{}` | per-entity renames (see below) |
 | `ptz_impulse` | `0.8` | seconds of movement per direction press |
 | `approach` | `DirectionRightDown` | final approach used for backlash compensation (`""` = off) |
@@ -81,7 +84,9 @@ relative to the directory of the cameras file, so mounting both into the
 container keeps them side by side.
 
 Reserved preset slots are refused at load time: `100`, `128`, `141`, `250` are
-used by the firmware itself and `255` lies outside the 255-entry table.
+used by the firmware itself and `255` lies outside the 255-entry table. The
+same rules apply to `preset_slots`. A `presets` slot outside `preset_slots` is
+allowed: goto works for it, save/delete do not.
 
 ## What each camera gets in Home Assistant
 
@@ -93,6 +98,10 @@ reports):
 | `button.*_ptz_directionleft/right/up/down` | `ptz_direction*` | bounded move + explicit stop |
 | `button.*_ptz_home` | `ptz_home` | `Reset` |
 | `button.*_preset_<slot>` | `preset_prefix` + preset label | `GotoPreset` with backlash compensation |
+| `select.*_preset_slot` | `preset_slot` | slot selection for save/delete (`entity_category: config`) |
+| `button.*_preset_save` | `preset_save` | `SetPreset` into the selected slot (`entity_category: config`) |
+| `button.*_preset_delete` | `preset_delete` | `ClearPreset` of the selected slot (`entity_category: config`) |
+| `sensor.*_preset_slots` | `preset_slots` | occupied slot count; attributes `slots`, `free`, `managed`, `reserved`, `last_action`, `last_error` |
 | `switch.*_osd_title`, `switch.*_osd_time` | `osd_title`, `osd_time` | `fVideo.GUISet` |
 | `number.*_volume` | `volume` | `fVideo.Volume` |
 | `number.*_white_light` | `white_light` | `Camera.WhiteLight` |
@@ -110,12 +119,50 @@ Assistant in another language:
 labels: {ptz_home: "PTZ домой", volume: "Громкость", preset_prefix: "Пресет"}
 ```
 
+Preset management adds five more label keys: `preset_auto_prefix` (name prefix
+for auto-discovered slots without a config label, default `Preset`),
+`preset_slot`, `preset_save`, `preset_delete`, `preset_slots`.
+
+## Preset management (v0.3.0)
+
+With `auto_presets: true` (the default) the bridge reads `Uart.PTZPreset` at
+startup and on every poll, and publishes a goto button for every usable slot
+the camera actually has — presets created in the vendor app appear in Home
+Assistant without a restart. Config `presets` provide the labels; auto slots
+are named `<preset_auto_prefix> <slot>`. The published set is capped by
+`max_presets` and never contains reserved slots.
+
+The `preset_ctl` entities manage the slots:
+
+* the **select** chooses the slot for save/delete; its value is retained and
+  restored after a bridge restart;
+* **save** stores the current position with the same gear-loading approach as
+  goto (`approach` / `preset_nudge`), so the saved point comes back accurately;
+* **delete** clears the slot (idempotent: deleting an empty slot is a success);
+  when the slot is neither occupied nor defined in `presets`, its button is
+  removed from Home Assistant with an empty retained discovery payload;
+* the **sensor** reports the camera truth as JSON: `count`, `slots`
+  (slot → label), `free` (whitelist minus occupied), `managed`, `reserved`,
+  `last_action`, `last_error`.
+
+Save/delete only accept slots from `preset_slots`; a DVRIP error is reported
+in `last_error` and never published as a success. Slot names are never written
+to the camera (`SetConfig Uart` is not used) — labels live in this file.
+
+`auto_presets: false` disables all of the above and keeps the exact 0.2.2
+entity set: buttons only from `presets`, no `preset_ctl` topics.
+
 ## Topics and availability
 
 | Topic | Direction | Content |
 |---|---|---|
 | `xiongmai/<name>/ptz/<Command>/set` | in | `PRESS`, e.g. `DirectionLeft`, `Reset` |
 | `xiongmai/<name>/preset/<slot>/set` | in | `PRESS` |
+| `xiongmai/<name>/preset_ctl/slot/set` | in | slot number as a string (select for save/delete) |
+| `xiongmai/<name>/preset_ctl/slot/state` | out | selected slot, retained |
+| `xiongmai/<name>/preset_ctl/save/set` | in | `PRESS` — `SetPreset` into the selected slot |
+| `xiongmai/<name>/preset_ctl/delete/set` | in | `PRESS` — `ClearPreset` of the selected slot |
+| `xiongmai/<name>/preset_ctl/slots/state` | out | JSON slots overview (see above), retained |
 | `xiongmai/<name>/osd_title/set`, `…/osd_time/set` | in | `ON` / `OFF` |
 | `xiongmai/<name>/volume/set`, `…/white_light/set` | in | `0`..`100` |
 | `xiongmai/<name>/state` | out | JSON with all current values |

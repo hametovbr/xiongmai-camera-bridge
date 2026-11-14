@@ -91,6 +91,10 @@ the capability):
 | `button.<name>_ptz_directionleft/right/up/down` | bounded move (default 0.8 s) and an explicit stop | `Direction*` + `Preset: -1` |
 | `button.<name>_ptz_home` | re-centres the head | `Reset` |
 | `button.<name>_preset_<slot>` | returns to the slot, with backlash compensation (~12 s) | `GotoPreset` |
+| `select.<name>_preset_slot` | chooses the slot for save/delete (config category) | — |
+| `button.<name>_preset_save` | stores the current view in the selected slot | `SetPreset` |
+| `button.<name>_preset_delete` | clears the selected slot | `ClearPreset` |
+| `sensor.<name>_preset_slots` | occupied slot count; attributes `slots`, `free`, `managed`, `reserved`, `last_action`, `last_error` | `Uart.PTZPreset` |
 | `switch.<name>_osd_title` | on-screen channel title | `fVideo.GUISet.ChannelTitleEnable` |
 | `switch.<name>_osd_time` | on-screen clock | `fVideo.GUISet.TimeTitleEnable` |
 | `number.<name>_volume` | speaker volume 0..100 | `fVideo.Volume[*].LeftVolume/RightVolume` |
@@ -112,6 +116,37 @@ of a false success.
 change the area of an existing device use the device page (**Settings → Devices**
 → the device → area).
 
+## Saving and deleting presets (v0.3.0)
+
+Preset buttons are no longer limited to the config: with `auto_presets: true`
+(the default) every usable slot the camera reports gets a goto button, and
+presets created in the vendor app appear on the next poll (default 30 s) —
+no HA or container restart. Config `presets` keep their labels; auto slots are
+named `<preset_auto_prefix> <slot>`.
+
+To manage slots from HA:
+
+1. pick a slot in `select.<name>_preset_slot` (options = the `preset_slots`
+   whitelist plus everything occupied);
+2. aim the camera with the direction buttons or the vendor app;
+3. press `button.<name>_preset_save` — the position is stored with the same
+   gear-loading approach as goto, a new button appears when the slot is new;
+4. `button.<name>_preset_delete` clears the slot; its button disappears from
+   HA (unless the slot is defined in `presets`). Deleting an empty slot is a
+   success.
+
+**Overwriting an occupied slot is irreversible** — the old point is gone from
+the camera. Put a `confirmation` on the save/delete buttons in your dashboard,
+e.g. "Save the current view into slot N? An occupied slot will be overwritten."
+
+Watch `sensor.<name>_preset_slots`: `last_action` reports the last save/delete,
+`last_error` the last failure (a DVRIP error is never shown as a success).
+Labels are not written to the camera: after a save from HA the button is named
+`<preset_auto_prefix> N` until you add a label to `presets` in `cameras.yml`.
+
+`auto_presets: false` restores the exact 0.2.2 behaviour (config-only buttons,
+no save/delete entities).
+
 ## 6. Verify it end to end
 
 1. Device page shows the entity count you expect: 7 buttons for a PTZ camera with
@@ -129,6 +164,23 @@ change the area of an existing device use the device page (**Settings → Device
    re-save the slot (see [ptz-presets.md](ptz-presets.md)).
 6. Stop the container: within a poll interval the entities go `unavailable`
    (both availability topics, `availability_mode: all`).
+7. Preset management: select a free slot, press **Save preset** — a new button
+   appears without restarts and `xiongmai-ptz slots` lists the slot; press
+   **Delete preset** — the slot is gone from the camera and the button from HA.
+   Verify a saved point by picture (`xiongmai-ptz mark/goto/check`, ≤ 6 px),
+   not by `Ret: 100`.
+
+### Preset management acceptance checklist
+
+- a preset created in the vendor app appears as a button within one poll
+  interval, without restarting HA or the container (within `max_presets`);
+- save from HA: the slot appears in `xiongmai-ptz slots`, the button appears
+  without restarts, goto returns to the view within ≤ 6 px of the frame;
+- delete from HA: the slot disappears from `xiongmai-ptz slots` and the entity
+  from HA;
+- reserved slots `100/128/141/250/255` are never published and never cleared;
+- other cameras' entities do not change during save/delete on one camera;
+- an offline camera shows `unavailable` entities without breaking the others.
 
 ## Troubleshooting
 
@@ -142,6 +194,8 @@ change the area of an existing device use the device page (**Settings → Device
 | `login failed: Ret=205` in the log, no device | wrong user or password; with `secret_file` the login is taken from the same secret object as the password |
 | Names in HA are English (`PTZ left`) | add `labels` — names change, `entity_id`s do not |
 | Preset returns to a slightly different view | backlash: keep the approach impulse, lower `preset_nudge` for a gentler nudge, or re-save the slot approaching from the same side |
+| A preset made in the app does not appear | check `max_presets` (cap) and that the slot is not reserved; the poll refreshes every `poll_seconds`; `auto_presets` must be on |
+| Save/delete does nothing, sensor shows `last_error` | no slot selected, the slot is outside `preset_slots`, or the camera rejected the command — read `last_error` on `sensor.<name>_preset_slots` |
 | Device disappeared after upgrading the image | `name` changed between configs, or discovery prefix differs (`DISCOVERY_PREFIX`) |
 
 ## Removing the bridge
